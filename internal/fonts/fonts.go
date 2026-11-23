@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"image"
 	"image/color"
+	"math"
 	"sync"
 
 	"golang.org/x/image/font"
@@ -60,10 +61,26 @@ type parsedFonts struct {
 }
 
 var (
-	initOnce sync.Once
-	parsed   parsedFonts
-	initErr  error
+	initOnce   sync.Once
+	parsed     parsedFonts
+	initErr    error
+	gammaToLin [256]uint16
+	linToGamma [4096]uint8
 )
+
+func init() {
+	// Precompute gamma 1.8 lookup tables for smooth, ink-rich optical anti-aliasing
+	// using pure integer lookups (fast on the XO-1 Geode LX with GO386=softfloat).
+	const gamma = 1.8
+	for i := 0; i < 256; i++ {
+		v := math.Pow(float64(i)/255.0, gamma) * 4095.0
+		gammaToLin[i] = uint16(math.Round(v))
+	}
+	for i := 0; i < 4096; i++ {
+		v := math.Pow(float64(i)/4095.0, 1.0/gamma) * 255.0
+		linToGamma[i] = uint8(math.Round(v))
+	}
+}
 
 func ensureParsed() error {
 	initOnce.Do(func() {
@@ -108,21 +125,26 @@ func ensureParsed() error {
 	return initErr
 }
 
+type glyphKey struct {
+	r     rune
+	phase uint8 // 0..3 quarter-pixel horizontal subpixel phase
+}
+
 type cachedGlyph struct {
-	dr      image.Rectangle // offset relative to baseline dot (0,0)
-	mask    *image.Alpha    // pre-rasterized alpha mask
+	dr      image.Rectangle // offset relative to integer pixel origin (0,0)
+	mask    *image.Alpha    // pre-rasterized analytical coverage alpha mask
 	advance fixed.Int26_6
 	valid   bool
 }
 
-// CachedFace wraps a font.Face with an in-memory glyph bitmap & advance cache.
-// On the OLPC XO-1's 433 MHz Geode LX (with GO386=softfloat), caching rasterized
-// alpha masks avoids repeated vector-outline rasterization and makes page turns
-// nearly instantaneous.
+// CachedFace wraps a font.Face with an in-memory 4-phase subpixel glyph bitmap &
+// advance cache. On the OLPC XO-1's 433 MHz Geode LX (with GO386=softfloat),
+// caching rasterized alpha masks avoids repeated vector-outline rasterization
+// while delivering smooth, book-quality proportional typography.
 type CachedFace struct {
 	face    font.Face
 	metrics font.Metrics
-	glyphs  map[rune]cachedGlyph
+	glyphs  map[glyphKey]cachedGlyph
 	advOnly map[rune]fixed.Int26_6
 }
 
@@ -133,7 +155,7 @@ func newCachedFace(otFont *opentype.Font, sizePx int) (*CachedFace, error) {
 	f, err := opentype.NewFace(otFont, &opentype.FaceOptions{
 		Size:    float64(sizePx),
 		DPI:     72, // 1pt == 1px so sizePx is exact pixel height
-		Hinting: font.HintingFull,
+		Hinting: font.HintingNone,
 	})
 	if err != nil {
 		return nil, err
@@ -141,7 +163,7 @@ func newCachedFace(otFont *opentype.Font, sizePx int) (*CachedFace, error) {
 	return &CachedFace{
 		face:    f,
 		metrics: f.Metrics(),
-		glyphs:  make(map[rune]cachedGlyph, 128),
+		glyphs:  make(map[glyphKey]cachedGlyph, 256),
 		advOnly: make(map[rune]fixed.Int26_6, 128),
 	}, nil
 }
@@ -179,11 +201,16 @@ func (cf *CachedFace) Advance(r rune) fixed.Int26_6 {
 	return adv
 }
 
-// MeasureString returns the fixed-point width of string s.
+// MeasureString returns the fixed-point width of string s including kerning.
 func (cf *CachedFace) MeasureString(s string) fixed.Int26_6 {
 	var w fixed.Int26_6
+	prevR := rune(-1)
 	for _, r := range s {
+		if prevR >= 0 && prevR != ' ' && r != ' ' {
+			w += cf.face.Kern(prevR, r)
+		}
 		w += cf.Advance(r)
+		prevR = r
 	}
 	return w
 }
@@ -193,17 +220,19 @@ func (cf *CachedFace) MeasureStringPx(s string) int {
 	return cf.MeasureString(s).Ceil()
 }
 
-func (cf *CachedFace) getGlyph(r rune) cachedGlyph {
-	if g, ok := cf.glyphs[r]; ok {
+func (cf *CachedFace) getGlyph(r rune, phase uint8) cachedGlyph {
+	key := glyphKey{r: r, phase: phase & 3}
+	if g, ok := cf.glyphs[key]; ok {
 		return g
 	}
 	// Cap cache size to bound RAM on the XO-1 (256 MB total).
-	if len(cf.glyphs) > 1024 {
-		cf.glyphs = make(map[rune]cachedGlyph, 128)
+	if len(cf.glyphs) > 2048 {
+		cf.glyphs = make(map[glyphKey]cachedGlyph, 256)
 	}
-	dr, mask, maskp, adv, ok := cf.face.Glyph(fixed.P(0, 0), r)
+	dot := fixed.Point26_6{X: fixed.Int26_6(key.phase) << 4, Y: 0}
+	dr, mask, maskp, adv, ok := cf.face.Glyph(dot, r)
 	if !ok {
-		dr, mask, maskp, adv, ok = cf.face.Glyph(fixed.P(0, 0), '?')
+		dr, mask, maskp, adv, ok = cf.face.Glyph(dot, '?')
 	}
 	var cg cachedGlyph
 	cg.advance = adv
@@ -228,25 +257,37 @@ func (cf *CachedFace) getGlyph(r rune) cachedGlyph {
 		}
 		cg.mask = alpha
 	}
-	cf.glyphs[r] = cg
+	cf.glyphs[key] = cg
 	cf.advOnly[r] = adv
 	return cg
 }
 
-// DrawString draws s onto dst starting at baseline point (x, y) using color col.
-// If crispMono is true (for XO-1 sunlight monochrome mode), alpha is thresholded
-// for razor-sharp 1-bit readability. Returns the new integer X coordinate.
+// DrawString draws s onto dst starting at baseline point (x, y) using color col
+// with 4-phase subpixel horizontal positioning and gamma-corrected anti-aliasing.
+// Returns the new integer X coordinate.
 func (cf *CachedFace) DrawString(dst *image.RGBA, x, y int, s string, col color.RGBA, crispMono bool) int {
 	dotX := fixed.I(x)
 	bounds := dst.Bounds()
-	sr := uint32(col.R)
-	sg := uint32(col.G)
-	sb := uint32(col.B)
+	sr := col.R
+	sg := col.G
+	sb := col.B
+	srLin := uint32(gammaToLin[sr])
+	sgLin := uint32(gammaToLin[sg])
+	sbLin := uint32(gammaToLin[sb])
+	prevR := rune(-1)
 
 	for _, r := range s {
-		cg := cf.getGlyph(r)
+		if prevR >= 0 && prevR != ' ' && r != ' ' {
+			dotX += cf.face.Kern(prevR, r)
+		}
+		// Quantize horizontal position to nearest quarter-pixel (0, 0.25, 0.50, 0.75)
+		q := (dotX + 8) >> 4
+		baseX := int(q >> 2)
+		phase := uint8(q & 3)
+
+		cg := cf.getGlyph(r, phase)
 		if cg.mask != nil {
-			gx := dotX.Round() + cg.dr.Min.X
+			gx := baseX + cg.dr.Min.X
 			gy := y + cg.dr.Min.Y
 			mw := cg.mask.Rect.Dx()
 			mh := cg.mask.Rect.Dy()
@@ -278,21 +319,24 @@ func (cf *CachedFace) DrawString(dst *image.RGBA, x, y int, s string, col color.
 					}
 					if crispMono {
 						if a >= 108 {
-							dst.Pix[dRow] = uint8(sr)
-							dst.Pix[dRow+1] = uint8(sg)
-							dst.Pix[dRow+2] = uint8(sb)
+							dst.Pix[dRow] = sr
+							dst.Pix[dRow+1] = sg
+							dst.Pix[dRow+2] = sb
 							dst.Pix[dRow+3] = 255
 						}
 					} else if a == 255 {
-						dst.Pix[dRow] = uint8(sr)
-						dst.Pix[dRow+1] = uint8(sg)
-						dst.Pix[dRow+2] = uint8(sb)
+						dst.Pix[dRow] = sr
+						dst.Pix[dRow+1] = sg
+						dst.Pix[dRow+2] = sb
 						dst.Pix[dRow+3] = 255
 					} else {
 						inv := 255 - a
-						dst.Pix[dRow] = uint8((sr*a + uint32(dst.Pix[dRow])*inv + 127) / 255)
-						dst.Pix[dRow+1] = uint8((sg*a + uint32(dst.Pix[dRow+1])*inv + 127) / 255)
-						dst.Pix[dRow+2] = uint8((sb*a + uint32(dst.Pix[dRow+2])*inv + 127) / 255)
+						lr := (srLin*a + uint32(gammaToLin[dst.Pix[dRow]])*inv + 127) / 255
+						lg := (sgLin*a + uint32(gammaToLin[dst.Pix[dRow+1]])*inv + 127) / 255
+						lb := (sbLin*a + uint32(gammaToLin[dst.Pix[dRow+2]])*inv + 127) / 255
+						dst.Pix[dRow] = linToGamma[lr]
+						dst.Pix[dRow+1] = linToGamma[lg]
+						dst.Pix[dRow+2] = linToGamma[lb]
 						dst.Pix[dRow+3] = 255
 					}
 					dRow += 4
@@ -300,6 +344,7 @@ func (cf *CachedFace) DrawString(dst *image.RGBA, x, y int, s string, col color.
 			}
 		}
 		dotX += cg.advance
+		prevR = r
 	}
 	return dotX.Round()
 }

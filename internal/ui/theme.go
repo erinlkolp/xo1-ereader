@@ -22,18 +22,18 @@ type Theme struct {
 var (
 	ThemeSunlight = Theme{
 		Name:        "sunlight",
-		Label:       "Sunlight (XO-1 Mono)",
+		Label:       "Sunlight (XO-1 High Contrast)",
 		Bg:          color.RGBA{255, 255, 255, 255},
 		Fg:          color.RGBA{0, 0, 0, 255},
-		Muted:       color.RGBA{0, 0, 0, 255},
-		Rule:        color.RGBA{0, 0, 0, 255},
-		CodeBg:      color.RGBA{235, 235, 235, 255},
+		Muted:       color.RGBA{56, 56, 56, 255},
+		Rule:        color.RGBA{72, 72, 72, 255},
+		CodeBg:      color.RGBA{238, 238, 238, 255},
 		PanelBg:     color.RGBA{255, 255, 255, 255},
 		PanelBorder: color.RGBA{0, 0, 0, 255},
 		SelectBg:    color.RGBA{0, 0, 0, 255},
 		SelectFg:    color.RGBA{255, 255, 255, 255},
 		Accent:      color.RGBA{0, 0, 0, 255},
-		CrispMono:   true,
+		CrispMono:   false,
 	}
 
 	ThemePaper = Theme{
